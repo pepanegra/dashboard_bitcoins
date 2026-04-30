@@ -25,3 +25,5 @@ def get_data():
 
 
 
+print(os.getenv("host"))
+print(os.getenv("user"))
