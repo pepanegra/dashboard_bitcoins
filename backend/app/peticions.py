@@ -9,8 +9,8 @@ def get_data():
     r = requests.get(os.getenv("api"))
 
     if r.status_code  == 200:
-      print("Peticion exiotosa")
-      return r.json()
+        print("Peticion exiotosa")
+        return r.json()
     
     elif r.status_code == 400:
         print("No encontrado")
@@ -19,7 +19,7 @@ def get_data():
     else:
         print(f'Error: {r.status_code}')
         return None
-     
+    
 
 
 
