@@ -179,7 +179,7 @@ def run_pipelines ():
     finally:
             if conn is not None:
                 conn.commit()
-                cursor.close()
+                cursor.close() # type: ignore
                 conn.close()
                 print('Operacion exitosa!!!')
                 print(conn)

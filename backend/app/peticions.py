@@ -6,7 +6,7 @@ import os
 
 def get_data():
     
-    r = requests.get(os.getenv("api"))
+    r = requests.get(os.getenv("api"))  # pyright: ignore[reportArgumentType]
 
     if r.status_code  == 200:
         print("Peticion exiotosa")

@@ -1,4 +1,6 @@
+import psycopg2
 import pandas as pd
+from psycopg2.extras import execute_values
 from sqlalchemy import create_engine, text
 import os
 from dotenv import load_dotenv
@@ -6,11 +8,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =============================================
-# CONEXIÓN CON SQLALCHEMY
+# CONEXIONES
 # =============================================
-# SQLAlchemy es el conector que pandas requiere para
-# read_sql y to_sql — permite leer y escribir DataFrames
-# directamente desde/hacia PostgreSQL sin conversiones manuales.
+# SQLAlchemy — solo para leer con pd.read_sql
+# psycopg2  — para escribir con ON CONFLICT
 
 engine = create_engine(
     f"postgresql://{os.getenv('user')}:{os.getenv('password')}"
@@ -18,22 +19,23 @@ engine = create_engine(
     f"?sslmode={os.getenv('sslmode')}"
 )
 
+conn = psycopg2.connect(
+    host=os.getenv("host"),
+    database=os.getenv("database"),
+    user=os.getenv("user"),
+    password=os.getenv("password"),
+    port=os.getenv("port"),
+    sslmode=os.getenv("sslmode")
+)
+
 
 # =============================================
-# CREAR TABLAS DE ANÁLISIS (solo primera vez)
+# CREAR TABLAS Y RESTRICCIONES (primera vez)
 # =============================================
-# IF NOT EXISTS evita error si ya existen.
 
-with engine.connect() as conn:
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS analysis_precio_historico (
-            name                 VARCHAR,
-            symbol               VARCHAR,
-            current_price        NUMERIC,
-            price_change_pct_24h NUMERIC,
-            last_updated         TIMESTAMP
-        );
-
+with engine.connect() as c:
+    # Crear tablas
+    c.execute(text("""
         CREATE TABLE IF NOT EXISTS analysis_comparar_monedas (
             name                 VARCHAR,
             symbol               VARCHAR,
@@ -44,7 +46,6 @@ with engine.connect() as conn:
             price_change_pct_24h NUMERIC,
             last_updated         TIMESTAMP
         );
-
         CREATE TABLE IF NOT EXISTS analysis_ath_atl (
             name              VARCHAR,
             symbol            VARCHAR,
@@ -56,7 +57,6 @@ with engine.connect() as conn:
             atl_change_pct    NUMERIC,
             distancia_ath_pct NUMERIC
         );
-
         CREATE TABLE IF NOT EXISTS analysis_volumen_marketcap (
             name                      VARCHAR,
             symbol                    VARCHAR,
@@ -66,7 +66,6 @@ with engine.connect() as conn:
             ratio_liquidez_pct        NUMERIC,
             last_updated              TIMESTAMP
         );
-
         CREATE TABLE IF NOT EXISTS analysis_supply (
             name               VARCHAR,
             symbol             VARCHAR,
@@ -77,46 +76,75 @@ with engine.connect() as conn:
             restante           NUMERIC
         );
     """))
+    c.commit()
+
+    # Restricciones UNIQUE — verificando si ya existen antes de crearlas
+    constraints = [
+        ("uq_comparar_symbol", "analysis_comparar_monedas", "symbol"),
+        ("uq_ath_symbol",      "analysis_ath_atl",           "symbol"),
+        ("uq_mercado_symbol",  "analysis_volumen_marketcap", "symbol"),
+        ("uq_supply_symbol",   "analysis_supply",            "symbol"),
+    ]
+
+    for constraint_name, tabla, columna in constraints:
+        # Verifica si la restricción ya existe en PostgreSQL
+        resultado = c.execute(text("""
+            SELECT COUNT(*) FROM information_schema.table_constraints
+            WHERE constraint_name = :nombre
+        """), {"nombre": constraint_name})
+
+        # Si no existe (COUNT = 0) la crea
+        if resultado.fetchone()[0] == 0:  # pyright: ignore[reportOptionalSubscript]
+            c.execute(text(f"""
+                ALTER TABLE {tabla}
+                ADD CONSTRAINT {constraint_name} UNIQUE ({columna})
+            """))
+            print(f"  ✓ Restricción {constraint_name} creada")
+        else:
+            print(f"  · {constraint_name} ya existe")
+
+    c.commit()
+    print("✓ Tablas y restricciones listas")
+
+
+# =============================================
+# FUNCIÓN AUXILIAR — guardar con ON CONFLICT
+# =============================================
+# execute_values inserta todas las filas de una vez
+# en lugar de fila por fila — mucho más rápido.
+# conflict_column — columna que detecta duplicados
+# update_columns  — columnas que se actualizan si ya existe
+
+def save_df(conn, df, tabla, conflict_column, update_columns):
+    cursor = conn.cursor()
+
+    # Convierte cada fila del DataFrame a una tupla
+    rows = [tuple(row) for row in df.itertuples(index=False)]
+
+    # Construye dinámicamente el SET del ON CONFLICT
+    # Ejemplo: "current_price = EXCLUDED.current_price, ..."
+    update_set = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
+
+    # Nombres de columnas separados por coma
+    columns = ", ".join(df.columns)
+
+    sql = f"""
+        INSERT INTO {tabla} ({columns})
+        VALUES %s
+        ON CONFLICT ({conflict_column}) DO UPDATE
+        SET {update_set}
+    """
+
+    execute_values(cursor, sql, rows)
     conn.commit()
-    print("✓ Tablas de análisis creadas")
+    cursor.close()
 
 
 # =============================================
-# 1. EVOLUCIÓN DEL PRECIO EN EL TIEMPO
+# 1. COMPARAR MONEDAS ENTRE SÍ
 # =============================================
-# pd.read_sql ejecuta el query y retorna un DataFrame
-# directamente — no necesitas fetchall() ni cursor.
-# pd.to_datetime convierte las fechas a objetos datetime
-# reales para poder filtrar y graficar por tiempo.
-
-df_precios = pd.read_sql("""
-    SELECT c.name, c.symbol, p.current_price,
-           p.price_change_pct_24h, p.last_updated
-    FROM coins c
-    JOIN prices p ON c.id = p.coin_id
-    ORDER BY c.id, p.last_updated ASC
-""", engine)
-
-df_precios["last_updated"]         = pd.to_datetime(df_precios["last_updated"])
-df_precios["current_price"]        = pd.to_numeric(df_precios["current_price"])
-df_precios["price_change_pct_24h"] = pd.to_numeric(df_precios["price_change_pct_24h"])
-
-# to_sql guarda el DataFrame en la tabla indicada.
-# if_exists="replace" borra y reescribe la tabla cada vez.
-# if_exists="append"  agrega filas sin borrar las anteriores.
-# index=False evita guardar el índice numérico de pandas como columna.
-df_precios.to_sql("analysis_precio_historico", engine, if_exists="replace", index=False)
-print("✓ analysis_precio_historico guardado —", len(df_precios), "filas")
-
-
-# =============================================
-# 2. COMPARAR MONEDAS ENTRE SÍ
-# =============================================
-# DISTINCT ON (c.id) trae solo el registro más reciente
-# por moneda — evita duplicados en el análisis.
-# sort_values ordena por precio descendente.
-# reset_index(drop=True) reinicia el índice 0,1,2...
-# después de ordenar.
+# DISTINCT ON (c.id) trae solo el precio más reciente
+# por moneda — sin duplicados.
 
 df_comparar = pd.read_sql("""
     SELECT DISTINCT ON (c.id)
@@ -133,17 +161,22 @@ df_comparar["price_change_pct_24h"] = pd.to_numeric(df_comparar["price_change_pc
 df_comparar["last_updated"]         = pd.to_datetime(df_comparar["last_updated"])
 df_comparar = df_comparar.sort_values("current_price", ascending=False).reset_index(drop=True)
 
-df_comparar.to_sql("analysis_comparar_monedas", engine, if_exists="replace", index=False)
+save_df(
+    conn             = conn,
+    df               = df_comparar,
+    tabla            = "analysis_comparar_monedas",
+    conflict_column  = "symbol",
+    update_columns   = ["current_price", "high_24h", "low_24h",
+                        "price_change_pct_24h", "last_updated"]
+)
 print("✓ analysis_comparar_monedas guardado —", len(df_comparar), "filas")
 
 
 # =============================================
-# 3. DISTANCIA AL ATH / ATL
+# 2. DISTANCIA AL ATH / ATL
 # =============================================
-# ath_change_pct viene negativo desde la API
-# (ej: -40.67 = está 40.67% por debajo del ATH).
-# abs() convierte a positivo — más fácil de leer
-# y graficar desde el frontend.
+# ath_change_pct viene negativo desde la API.
+# abs() lo convierte a positivo para el frontend.
 
 df_ath = pd.read_sql("""
     SELECT c.name, c.symbol,
@@ -160,17 +193,24 @@ df_ath["ath_date"]          = pd.to_datetime(df_ath["ath_date"])
 df_ath["atl_date"]          = pd.to_datetime(df_ath["atl_date"])
 df_ath["distancia_ath_pct"] = df_ath["ath_change_pct"].abs()
 
-df_ath.to_sql("analysis_ath_atl", engine, if_exists="replace", index=False)
+save_df(
+    conn             = conn,
+    df               = df_ath,
+    tabla            = "analysis_ath_atl",
+    conflict_column  = "symbol",
+    update_columns   = ["ath", "ath_date", "ath_change_pct",
+                        "atl", "atl_date", "atl_change_pct",
+                        "distancia_ath_pct"]
+)
 print("✓ analysis_ath_atl guardado —", len(df_ath), "filas")
 
 
 # =============================================
-# 4. VOLUMEN VS MARKET CAP
+# 3. VOLUMEN VS MARKET CAP
 # =============================================
-# fillna(0) reemplaza None/NaN con 0 para no romper
-# la división al calcular el ratio de liquidez.
-# replace(0, nan) en el divisor evita división por cero.
-# round(4) redondea a 4 decimales para legibilidad.
+# ratio_liquidez = (volumen / market_cap) * 100
+# fillna(0) evita errores con valores nulos.
+# replace(0, nan) evita división por cero.
 
 df_mercado = pd.read_sql("""
     SELECT DISTINCT ON (c.id)
@@ -182,28 +222,33 @@ df_mercado = pd.read_sql("""
     ORDER BY c.id, m.last_updated DESC
 """, engine)
 
-df_mercado["market_cap"]   = pd.to_numeric(df_mercado["market_cap"]).fillna(0)
-df_mercado["total_volume"] = pd.to_numeric(df_mercado["total_volume"]).fillna(0)
-df_mercado["last_updated"] = pd.to_datetime(df_mercado["last_updated"])
-
+df_mercado["market_cap"]         = pd.to_numeric(df_mercado["market_cap"]).fillna(0)
+df_mercado["total_volume"]       = pd.to_numeric(df_mercado["total_volume"]).fillna(0)
+df_mercado["last_updated"]       = pd.to_datetime(df_mercado["last_updated"])
 df_mercado["ratio_liquidez_pct"] = (
     df_mercado["total_volume"] /
     df_mercado["market_cap"].replace(0, float("nan")) * 100
 ).round(4)
-
 df_mercado = df_mercado.sort_values("market_cap", ascending=False).reset_index(drop=True)
 
-df_mercado.to_sql("analysis_volumen_marketcap", engine, if_exists="replace", index=False)
+save_df(
+    conn             = conn,
+    df               = df_mercado,
+    tabla            = "analysis_volumen_marketcap",
+    conflict_column  = "symbol",
+    update_columns   = ["market_cap", "total_volume",
+                        "market_cap_change_pct_24h",
+                        "ratio_liquidez_pct", "last_updated"]
+)
 print("✓ analysis_volumen_marketcap guardado —", len(df_mercado), "filas")
 
 
 # =============================================
-# 5. SUPPLY MINADO VS RESTANTE
+# 4. SUPPLY MINADO VS RESTANTE
 # =============================================
-# Solo monedas con max_supply definido (WHERE en SQL)
-# para evitar división por None en pandas.
 # pct_minado = cuánto % del total ya fue emitido.
 # restante   = cuántos tokens faltan por emitir.
+# WHERE max_supply IS NOT NULL — solo monedas con límite.
 
 df_supply = pd.read_sql("""
     SELECT c.name, c.symbol,
@@ -215,27 +260,29 @@ df_supply = pd.read_sql("""
 """, engine)
 
 df_supply["circulating_supply"] = pd.to_numeric(df_supply["circulating_supply"])
-df_supply["max_supply"]         = pd.to_numeric(df_supply["max_supply"])
 df_supply["total_supply"]       = pd.to_numeric(df_supply["total_supply"])
-
-df_supply["pct_minado"] = (
+df_supply["max_supply"]         = pd.to_numeric(df_supply["max_supply"])
+df_supply["pct_minado"]         = (
     df_supply["circulating_supply"] / df_supply["max_supply"] * 100
 ).round(2)
-
 df_supply["restante"] = df_supply["max_supply"] - df_supply["circulating_supply"]
 
-df_supply.to_sql("analysis_supply", engine, if_exists="replace", index=False)
+save_df(
+    conn             = conn,
+    df               = df_supply,
+    tabla            = "analysis_supply",
+    conflict_column  = "symbol",
+    update_columns   = ["circulating_supply", "total_supply",
+                        "max_supply", "pct_minado", "restante"]
+)
 print("✓ analysis_supply guardado —", len(df_supply), "filas")
 
 
 # =============================================
 # VERIFICACIÓN FINAL
 # =============================================
-# Leemos cuántas filas quedaron en cada tabla
-# para confirmar que todo se guardó correctamente.
 
 tablas = [
-    "analysis_precio_historico",
     "analysis_comparar_monedas",
     "analysis_ath_atl",
     "analysis_volumen_marketcap",
@@ -243,11 +290,14 @@ tablas = [
 ]
 
 print("\n── Verificación ─────────────────────────────")
-with engine.connect() as conn:
+with engine.connect() as c:
     for tabla in tablas:
-        resultado = conn.execute(text(f"SELECT COUNT(*) FROM {tabla}"))
-        count = resultado.fetchone()[0]
+        resultado = c.execute(text(f"SELECT COUNT(*) FROM {tabla}"))
+        count = resultado.fetchone()[0] # pyright: ignore[reportOptionalSubscript]
         print(f"  {tabla}: {count} filas")
 
 print("\n✓ Transformaciones completadas")
-engine.dispose()  # Cierra todas las conexiones del pool
+
+# Cierra todas las conexiones
+conn.close()
+engine.dispose()
