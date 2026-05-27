@@ -158,7 +158,7 @@ def run_pipelines ():
             user=os.getenv("user"),
             password=os.getenv("password"),
             port=os.getenv("port"),
-            sslmode=os.getenv("sslmodete")
+            sslmode=os.getenv("sslmode")
         )
         if conn:
             print("Abriendo conexion segura")
